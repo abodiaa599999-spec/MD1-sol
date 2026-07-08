@@ -1,0 +1,98 @@
+# Build for Solscan Verify — creates a ZIP artifact containing source + idl/.so if present
+name: Build for Solscan Verify
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install system deps & Solana CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev clang curl build-essential zip unzip libudev-dev protobuf-compiler
+          # Install Solana CLI v1.18.26 via the official Anza installer (release.solana.com is deprecated)
+          sh -c "$(curl -sSfL https://release.anza.xyz/v1.18.26/install)"
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          solana --version
+          echo "--- contents of active_release/bin ---"
+          ls -la "$HOME/.local/share/solana/install/active_release/bin"
+          which cargo-build-sbf
+
+      - name: Install Rust toolchain and Anchor CLI
+        timeout-minutes: 25
+        run: |
+          if [ -f rust-toolchain.toml ]; then
+            echo "Using rust-toolchain.toml from repo"
+          else
+            rustup default 1.89.0
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # NOTE: removed --locked so Cargo can pick a newer, unbroken `time` crate
+          cargo install --version 0.30.1 anchor-cli
+          anchor --version
+          rustc --version
+          cargo --version
+
+      - name: Regenerate Cargo.lock with correct MSRV target
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Pin transitive deps to versions compiled with edition2021 (compatible with the old cargo bundled in Solana v1.18.26 platform-tools)
+          cargo update -p zeroize --precise 1.7.0 || true
+          cargo update -p zeroize_derive --precise 1.4.2 || true
+          cargo update -p hashbrown --precise 0.15.2 || true
+          # Downgrade Cargo.lock format so the older bundled cargo can parse it
+          if grep -q '^version = 4$' Cargo.lock; then
+            sed -i 's/^version = 4$/version = 3/' Cargo.lock
+            echo "Cargo.lock downgraded to version 3"
+          else
+            echo "Cargo.lock already compatible or pattern not found"
+          fi
+
+      - name: Build Anchor program
+        run: |
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$HOME/.cargo/bin:$PATH"
+          anchor build
+
+      - name: Remove any private key files (safety)
+        run: |
+          find . -type f -name "*keypair.json" -print -delete || true
+          find . -type f -name "id.json" -print -delete || true
+
+      - name: Prepare solscan zip
+        run: |
+          PROGRAM_PUBKEY="3fN2LAt47q3oSgNq4dJZt4DuAh5yJw6mb6B3dRYJGHa8"
+          ZIP_NAME="${PROGRAM_PUBKEY}-solscan.zip"
+          rm -rf solscan_package || true
+          mkdir -p solscan_package
+          cp -n Anchor.toml Cargo.toml Cargo.lock rust-toolchain.toml solscan_package/ 2>/dev/null || true
+          [ -f README.md ] && cp README.md solscan_package/ || true
+          [ -f LICENSE ] && cp LICENSE solscan_package/ || true
+          cp -r programs solscan_package/ || true
+          if [ -d target/idl ]; then
+            mkdir -p solscan_package/target
+            cp -r target/idl solscan_package/target/ || true
+          fi
+          if [ -d target/deploy ]; then
+            mkdir -p solscan_package/target
+            cp -r target/deploy solscan_package/target/ || true
+          fi
+          find solscan_package -type f -name "*keypair.json" -print -delete || true
+          zip -r "$ZIP_NAME" solscan_package || true
+          ls -lah "$ZIP_NAME" || true
+
+      - name: Upload artifact (solscan zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: solscan-zip
+          path: "*.zip"
+
+      - name: Print info (versions + next steps)
+        run: |
+          echo "Program: 3fN2LAt47q3oSgNq4dJZt4DuAh5yJw6mb6B3dRYJGHa8"
+          anchor --version || true
+          rustc --version || true
+          solana --version || true
